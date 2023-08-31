@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/containerservice/mgmt/2022-03-01/containerservice"
+	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"k8s.io/utils/ptr"
@@ -303,11 +304,6 @@ func (s *ManagedClusterSpec) Parameters(ctx context.Context, existing interface{
 				ClientID: ptr.To("msi"),
 			},
 			AgentPoolProfiles: &[]containerservice.ManagedClusterAgentPoolProfile{},
-			NetworkProfile: &containerservice.NetworkProfile{
-				NetworkPlugin:   containerservice.NetworkPlugin(s.NetworkPlugin),
-				LoadBalancerSku: containerservice.LoadBalancerSku(s.LoadBalancerSKU),
-				NetworkPolicy:   containerservice.NetworkPolicy(s.NetworkPolicy),
-			},
 		},
 	}
 
@@ -324,29 +320,10 @@ func (s *ManagedClusterSpec) Parameters(ctx context.Context, existing interface{
 		}
 	}
 
-	if s.PodCIDR != "" {
-		managedCluster.NetworkProfile.PodCidr = &s.PodCIDR
+	managedCluster.NetworkProfile, err = s.buildNetworkProfile()
+	if err != nil {
+		return nil, err
 	}
-
-	if s.ServiceCIDR != "" {
-		if s.DNSServiceIP == nil {
-			managedCluster.NetworkProfile.ServiceCidr = &s.ServiceCIDR
-			ip, _, err := net.ParseCIDR(s.ServiceCIDR)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse service cidr: %w", err)
-			}
-			// HACK: set the last octet of the IP to .10
-			// This ensures the dns IP is valid in the service cidr without forcing the user
-			// to specify it in both the Capi cluster and the Azure control plane.
-			// https://golang.org/src/net/ip.go#L48
-			ip[15] = byte(10)
-			dnsIP := ip.String()
-			managedCluster.NetworkProfile.DNSServiceIP = &dnsIP
-		} else {
-			managedCluster.NetworkProfile.DNSServiceIP = s.DNSServiceIP
-		}
-	}
-
 	if s.AADProfile != nil {
 		managedCluster.AadProfile = &containerservice.ManagedClusterAADProfile{
 			Managed:             &s.AADProfile.Managed,
@@ -355,19 +332,7 @@ func (s *ManagedClusterSpec) Parameters(ctx context.Context, existing interface{
 		}
 	}
 
-	for i := range s.AddonProfiles {
-		if managedCluster.AddonProfiles == nil {
-			managedCluster.AddonProfiles = map[string]*containerservice.ManagedClusterAddonProfile{}
-		}
-		item := s.AddonProfiles[i]
-		addonProfile := &containerservice.ManagedClusterAddonProfile{
-			Enabled: &item.Enabled,
-		}
-		if item.Config != nil {
-			addonProfile.Config = azure.StringMapPtr(item.Config)
-		}
-		managedCluster.AddonProfiles[item.Name] = addonProfile
-	}
+	SetAddOnProfiles(s.AddonProfiles, &managedCluster)
 
 	if s.SKU != nil {
 		tierName := containerservice.ManagedClusterSKUTier(s.SKU.Tier)
@@ -376,23 +341,9 @@ func (s *ManagedClusterSpec) Parameters(ctx context.Context, existing interface{
 			Tier: tierName,
 		}
 	}
-
-	if s.LoadBalancerProfile != nil {
-		managedCluster.NetworkProfile.LoadBalancerProfile = s.GetLoadBalancerProfile()
-	}
-
 	if s.APIServerAccessProfile != nil {
-		managedCluster.APIServerAccessProfile = &containerservice.ManagedClusterAPIServerAccessProfile{
-			EnablePrivateCluster:           s.APIServerAccessProfile.EnablePrivateCluster,
-			PrivateDNSZone:                 s.APIServerAccessProfile.PrivateDNSZone,
-			EnablePrivateClusterPublicFQDN: s.APIServerAccessProfile.EnablePrivateClusterPublicFQDN,
-		}
-
-		if s.APIServerAccessProfile.AuthorizedIPRanges != nil {
-			managedCluster.APIServerAccessProfile.AuthorizedIPRanges = &s.APIServerAccessProfile.AuthorizedIPRanges
-		}
+		managedCluster.APIServerAccessProfile = BuildAPIServerAccessProfile(s.APIServerAccessProfile)
 	}
-
 	if s.OutboundType != nil {
 		managedCluster.NetworkProfile.OutboundType = containerservice.OutboundType(*s.OutboundType)
 	}
@@ -419,41 +370,50 @@ func (s *ManagedClusterSpec) Parameters(ctx context.Context, existing interface{
 		if !ok {
 			return nil, fmt.Errorf("%T is not a containerservice.ManagedCluster", existing)
 		}
-		ps := *existingMC.ManagedClusterProperties.ProvisioningState
-		if ps != string(infrav1.Canceled) && ps != string(infrav1.Failed) && ps != string(infrav1.Succeeded) {
-			return nil, azure.WithTransientError(errors.Errorf("Unable to update existing managed cluster in non-terminal state. Managed cluster must be in one of the following provisioning states: Canceled, Failed, or Succeeded. Actual state: %s", ps), 20*time.Second)
+		if err := BuildManagedClusterFromExistingParameter(existingMC, &managedCluster, log); err != nil {
+			return nil, err
 		}
+		/*
+		   existingMC, ok := existing.(containerservice.ManagedCluster)
+		   if !ok {
+		       return nil, fmt.Errorf("%T is not a containerservice.ManagedCluster", existing)
+		   }
+		   ps := *existingMC.ManagedClusterProperties.ProvisioningState
+		   if ps != string(infrav1.Canceled) && ps != string(infrav1.Failed) && ps != string(infrav1.Succeeded) {
+		       return nil, azure.WithTransientError(errors.Errorf("Unable to update existing managed cluster in non-terminal state. Managed cluster must be in one of the following provisioning states: Canceled, Failed, or Succeeded. Actual state: %s", ps), 20*time.Second)
+		   }
 
-		// Normalize the LoadBalancerProfile so the diff below doesn't get thrown off by AKS added properties.
-		if managedCluster.NetworkProfile.LoadBalancerProfile == nil {
-			// If our LoadBalancerProfile generated by the spec is nil, then don't worry about what AKS has added.
-			existingMC.NetworkProfile.LoadBalancerProfile = nil
-		} else {
-			// If our LoadBalancerProfile generated by the spec is not nil, then remove the effective outbound IPs from
-			// AKS.
-			existingMC.NetworkProfile.LoadBalancerProfile.EffectiveOutboundIPs = nil
-		}
+		   // Normalize the LoadBalancerProfile so the diff below doesn't get thrown off by AKS added properties.
+		   if managedCluster.NetworkProfile.LoadBalancerProfile == nil {
+		       // If our LoadBalancerProfile generated by the spec is nil, then don't worry about what AKS has added.
+		       existingMC.NetworkProfile.LoadBalancerProfile = nil
+		   } else {
+		       // If our LoadBalancerProfile generated by the spec is not nil, then remove the effective outbound IPs from
+		       // AKS.
+		       existingMC.NetworkProfile.LoadBalancerProfile.EffectiveOutboundIPs = nil
+		   }
 
-		// Avoid changing agent pool profiles through AMCP and just use the existing agent pool profiles
-		// AgentPool changes are managed through AMMP.
-		managedCluster.AgentPoolProfiles = existingMC.AgentPoolProfiles
+		   // Avoid changing agent pool profiles through AMCP and just use the existing agent pool profiles
+		   // AgentPool changes are managed through AMMP.
+		   managedCluster.AgentPoolProfiles = existingMC.AgentPoolProfiles
 
-		// if the AuthorizedIPRanges is nil in the user-updated spec, but not nil in the existing spec, then
-		// we need to set the AuthorizedIPRanges to empty array (&[]string{}) once so that the Azure API will
-		// update the existing authorized IP ranges to nil.
-		if !isAuthIPRangesNilOrEmpty(existingMC) && isAuthIPRangesNilOrEmpty(managedCluster) {
-			log.V(4).Info("managed cluster spec has nil AuthorizedIPRanges, updating existing authorized IP ranges to an empty list")
-			managedCluster.APIServerAccessProfile = &containerservice.ManagedClusterAPIServerAccessProfile{
-				AuthorizedIPRanges: &[]string{},
-			}
-		}
+		   // if the AuthorizedIPRanges is nil in the user-updated spec, but not nil in the existing spec, then
+		   // we need to set the AuthorizedIPRanges to empty array (&[]string{}) once so that the Azure API will
+		   // update the existing authorized IP ranges to nil.
+		   if !isAuthIPRangesNilOrEmpty(existingMC) && isAuthIPRangesNilOrEmpty(managedCluster) {
+		       log.V(4).Info("managed cluster spec has nil AuthorizedIPRanges, updating existing authorized IP ranges to an empty list")
+		       managedCluster.APIServerAccessProfile = &containerservice.ManagedClusterAPIServerAccessProfile{
+		           AuthorizedIPRanges: &[]string{},
+		       }
+		   }
 
-		diff := computeDiffOfNormalizedClusters(managedCluster, existingMC)
-		if diff == "" {
-			log.V(4).Info("no changes found between user-updated spec and existing spec")
-			return nil, nil
-		}
-		log.V(4).Info("found a diff between the desired spec and the existing managed cluster", "difference", diff)
+		   diff := computeDiffOfNormalizedClusters(managedCluster, existingMC)
+		   if diff == "" {
+		       log.V(4).Info("no changes found between user-updated spec and existing spec")
+		       return nil, nil
+		   }
+		   log.V(4).Info("found a diff between the desired spec and the existing managed cluster", "difference", diff)
+		*/
 	} else {
 		// Add all agent pools to cluster spec that will be submitted to the API
 		agentPoolSpecs, err := s.GetAllAgentPools()
@@ -690,4 +650,146 @@ func isAuthIPRangesNilOrEmpty(managedCluster containerservice.ManagedCluster) bo
 		return true
 	}
 	return false
+}
+
+// buildNetworkProfile will build the network profile for managed cluster
+func (s *ManagedClusterSpec) buildNetworkProfile() (*containerservice.NetworkProfile, error) {
+	networkProfile := &containerservice.NetworkProfile{
+		NetworkPlugin:   containerservice.NetworkPlugin(s.NetworkPlugin),
+		LoadBalancerSku: containerservice.LoadBalancerSku(s.LoadBalancerSKU),
+		NetworkPolicy:   containerservice.NetworkPolicy(s.NetworkPolicy),
+	}
+
+	if s.PodCIDR != "" {
+		networkProfile.PodCidr = &s.PodCIDR
+	}
+
+	if s.ServiceCIDR != "" {
+		if s.DNSServiceIP == nil {
+			networkProfile.ServiceCidr = &s.ServiceCIDR
+			ip, _, err := net.ParseCIDR(s.ServiceCIDR)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse service cidr: %w", err)
+			}
+			// HACK: set the last octet of the IP to .10
+			// This ensures the dns IP is valid in the service cidr without forcing the user
+			// to specify it in both the Capi cluster and the Azure control plane.
+			// https://golang.org/src/net/ip.go#L48
+			ip[15] = byte(10)
+			dnsIP := ip.String()
+			networkProfile.DNSServiceIP = &dnsIP
+		} else {
+			networkProfile.DNSServiceIP = s.DNSServiceIP
+		}
+	}
+
+	if s.LoadBalancerProfile != nil {
+		networkProfile.LoadBalancerProfile = s.GetLoadBalancerProfile()
+	}
+
+	if s.OutboundType != nil {
+		networkProfile.OutboundType = containerservice.OutboundType(*s.OutboundType)
+	}
+
+	return networkProfile, nil
+}
+
+func SetAddOnProfiles(profiles []AddonProfile, managedCluster *containerservice.ManagedCluster) {
+	for i := range profiles {
+		if managedCluster.AddonProfiles == nil {
+			managedCluster.AddonProfiles = map[string]*containerservice.ManagedClusterAddonProfile{}
+		}
+		item := profiles[i]
+		addonProfile := &containerservice.ManagedClusterAddonProfile{
+			Enabled: &item.Enabled,
+		}
+		if item.Config != nil {
+			addonProfile.Config = azure.StringMapPtr(item.Config)
+		}
+		managedCluster.AddonProfiles[item.Name] = addonProfile
+	}
+}
+
+// BuildAPIServerAccessProfile
+func BuildAPIServerAccessProfile(serverAccessProfile *APIServerAccessProfile) *containerservice.ManagedClusterAPIServerAccessProfile {
+
+	apiServerAccessProfile := &containerservice.ManagedClusterAPIServerAccessProfile{
+		EnablePrivateCluster:           serverAccessProfile.EnablePrivateCluster,
+		PrivateDNSZone:                 serverAccessProfile.PrivateDNSZone,
+		EnablePrivateClusterPublicFQDN: serverAccessProfile.EnablePrivateClusterPublicFQDN,
+	}
+
+	if serverAccessProfile.AuthorizedIPRanges != nil {
+		apiServerAccessProfile.AuthorizedIPRanges = &serverAccessProfile.AuthorizedIPRanges
+	}
+
+	return apiServerAccessProfile
+}
+
+func BuildManagedClusterFromExistingParameter(existingMC containerservice.ManagedCluster, managedCluster *containerservice.ManagedCluster, log logr.Logger) error {
+
+	ps := *existingMC.ManagedClusterProperties.ProvisioningState
+	if ps != string(infrav1.Canceled) && ps != string(infrav1.Failed) && ps != string(infrav1.Succeeded) {
+		return azure.WithTransientError(errors.Errorf("Unable to update existing managed cluster in non-terminal state. Managed cluster must be in one of the following provisioning states: Canceled, Failed, or Succeeded. Actual state: %s", ps), 20*time.Second)
+	}
+
+	// Normalize the LoadBalancerProfile so the diff below doesn't get thrown off by AKS added properties.
+	if managedCluster.NetworkProfile.LoadBalancerProfile == nil {
+		// If our LoadBalancerProfile generated by the spec is nil, then don't worry about what AKS has added.
+		existingMC.NetworkProfile.LoadBalancerProfile = nil
+	} else {
+		// If our LoadBalancerProfile generated by the spec is not nil, then remove the effective outbound IPs from
+		// AKS.
+		existingMC.NetworkProfile.LoadBalancerProfile.EffectiveOutboundIPs = nil
+	}
+
+	// Avoid changing agent pool profiles through AMCP and just use the existing agent pool profiles
+	// AgentPool changes are managed through AMMP.
+	managedCluster.AgentPoolProfiles = existingMC.AgentPoolProfiles
+
+	// if the AuthorizedIPRanges is nil in the user-updated spec, but not nil in the existing spec, then
+	// we need to set the AuthorizedIPRanges to empty array (&[]string{}) once so that the Azure API will
+	// update the existing authorized IP ranges to nil.
+	if !isAuthIPRangesNilOrEmpty(existingMC) && isAuthIPRangesNilOrEmpty(*managedCluster) {
+		log.V(4).Info("managed cluster spec has nil AuthorizedIPRanges, updating existing authorized IP ranges to an empty list")
+		managedCluster.APIServerAccessProfile = &containerservice.ManagedClusterAPIServerAccessProfile{
+			AuthorizedIPRanges: &[]string{},
+		}
+	}
+
+	diff := computeDiffOfNormalizedClusters(*managedCluster, existingMC)
+	if diff == "" {
+		log.V(4).Info("no changes found between user-updated spec and existing spec")
+		return nil
+	}
+	log.V(4).Info("found a diff between the desired spec and the existing managed cluster", "difference", diff)
+
+	return nil
+}
+
+// buildAgentPoolProfiles builds the agent pool profiles from managed cluster spec
+func buildAgentPoolProfiles(ctx context.Context, managedClusterSpec *ManagedClusterSpec) (*[]containerservice.ManagedClusterAgentPoolProfile, error) {
+	agentPoolSpecs, err := managedClusterSpec.GetAllAgentPools()
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get agent pool specs for managed cluster %s", managedClusterSpec.Name)
+	}
+
+	agentPoolProfiles := &[]containerservice.ManagedClusterAgentPoolProfile{}
+	for _, spec := range agentPoolSpecs {
+		params, err := spec.Parameters(ctx, nil)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to get agent pool parameters for managed cluster %s", managedClusterSpec.Name)
+		}
+
+		agentPool, ok := params.(containerservice.AgentPool)
+		if !ok {
+			return nil, fmt.Errorf("%T is not a containerservice.AgentPool", agentPool)
+		}
+
+		agentPool.Name = ptr.To(spec.ResourceName())
+		profile := converters.AgentPoolToManagedClusterAgentPoolProfile(agentPool)
+		*agentPoolProfiles = append(*agentPoolProfiles, profile)
+	}
+
+	return agentPoolProfiles, nil
 }
